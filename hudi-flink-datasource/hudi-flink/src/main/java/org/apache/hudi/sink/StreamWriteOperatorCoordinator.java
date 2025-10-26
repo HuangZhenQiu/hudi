@@ -20,10 +20,14 @@ package org.apache.hudi.sink;
 
 import org.apache.hudi.client.HoodieFlinkWriteClient;
 import org.apache.hudi.client.WriteStatus;
+import org.apache.hudi.common.model.HoodieCommitMetadata;
 import org.apache.hudi.common.model.HoodieTableType;
 import org.apache.hudi.common.model.WriteOperationType;
 import org.apache.hudi.common.table.HoodieTableMetaClient;
+import org.apache.hudi.common.table.timeline.HoodieActiveTimeline;
+import org.apache.hudi.common.table.timeline.HoodieInstant;
 import org.apache.hudi.common.table.timeline.HoodieTimeline;
+import org.apache.hudi.common.table.timeline.TimelineUtils;
 import org.apache.hudi.common.util.CommitUtils;
 import org.apache.hudi.common.util.Option;
 import org.apache.hudi.common.util.SerializationUtils;
@@ -52,6 +56,7 @@ import org.apache.hudi.util.StreamerUtil;
 
 import org.apache.flink.annotation.VisibleForTesting;
 import org.apache.flink.configuration.Configuration;
+import org.apache.flink.runtime.checkpoint.CheckpointIDCounter;
 import org.apache.flink.runtime.jobgraph.OperatorID;
 import org.apache.flink.runtime.operators.coordination.CoordinationRequest;
 import org.apache.flink.runtime.operators.coordination.CoordinationRequestHandler;
@@ -79,6 +84,7 @@ import java.util.stream.Collectors;
 
 import static org.apache.hudi.common.table.timeline.InstantComparison.GREATER_THAN_OR_EQUALS;
 import static org.apache.hudi.common.table.timeline.InstantComparison.compareTimestamps;
+import static org.apache.hudi.util.StreamerUtil.FLINK_CHECKPOINT_ID;
 import static org.apache.hudi.util.StreamerUtil.initTableIfNotExists;
 
 /**
@@ -582,6 +588,46 @@ public class StreamWriteOperatorCoordinator
     }
     doCommit(checkpointId, instant, writeResults);
     return true;
+  }
+
+  /**
+   * Find the flink checkpoint id from the extra metadata from last commit.
+   */
+  private int findLastCommittedCheckpointId() {
+
+    if (!conf.get(FlinkOptions.WRITE_EXTRA_METADATA_ENABLED)) {
+      return -1;
+    }
+
+    try {
+      HoodieActiveTimeline activeTimeline = metaClient.getActiveTimeline();
+
+      // Find the last completed commit
+      HoodieTimeline completedTimeLine = activeTimeline.filterCompletedInstants()
+          .filter(i -> i.getAction().equals(HoodieTimeline.COMMIT_ACTION) || i.getAction().equals(HoodieTimeline.DELTA_COMMIT_ACTION));
+
+
+      Option<HoodieInstant> lastInstantOpt = completedTimeLine.lastInstant();
+      if (!lastInstantOpt.isPresent()) {
+        LOG.warn("No completed checkpoints found to find checkpoint id in the hudi commit metadata.");
+
+        // Return the initial checkpoint ID
+        return CheckpointIDCounter.INITIAL_CHECKPOINT_ID;
+      }
+
+      try {
+        HoodieInstant lastInstance = lastInstantOpt.get();
+        HoodieCommitMetadata commitMetadata =  TimelineUtils.getCommitMetadata(lastInstance, completedTimeLine);
+        return Integer.parseInt(commitMetadata.getExtraMetadata().get(FLINK_CHECKPOINT_ID));
+      } catch (Exception e) {
+        LOG.warn("Not able to find last completed checkpoint id from the last hudi commit metadata.", e);
+      }
+    } catch (Exception e) {
+      LOG.warn("Failed to find completed timeline.", e);
+    }
+
+    // Return the initial checkpoint ID
+    return CheckpointIDCounter.INITIAL_CHECKPOINT_ID;
   }
 
   /**
